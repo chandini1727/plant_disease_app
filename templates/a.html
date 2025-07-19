@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plant Disease Detection System</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌱 Plant Disease Detection</h1>
+            <p>Upload an image to identify plant diseases and get treatment recommendations</p>
+        </div>
+
+        <div class="main-content">
+            <!-- Error Display -->
+            {% if error %}
+            <div class="error">
+                <strong>Error:</strong> {{ error }}
+            </div>
+            {% endif %}
+
+            <!-- Upload Form (show only if no prediction) -->
+            {% if not prediction %}
+            <div class="upload-section">
+                <form method="POST" enctype="multipart/form-data">
+                    <div class="upload-area">
+                        <div class="upload-icon">
+                            <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+                                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                            </svg>
+                        </div>
+                        <h3>Upload Plant Image</h3>
+                        <p>Select an image file to analyze</p>
+                        <div class="file-input">
+                            <input type="file" name="image" accept="image/*" required id="fileInput">
+                            <label for="fileInput" class="file-input-label">
+                                <div class="file-input-icon">
+                                    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                                        <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                                    </svg>
+                                </div>
+                                Choose File
+                            </label>
+                            <div class="file-selected" id="fileSelected">
+                                <div class="file-selected-icon">✓</div>
+                                <span id="fileName">No file selected</span>
+                            </div>
+                        </div>
+                        <div class="file-info">
+                            <span>JPG, PNG, WebP • Max 10MB</span>
+                        </div>
+                    </div>
+                    <button type="submit" class="submit-btn">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                            <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/>
+                        </svg>
+                        Analyze Plant
+                    </button>
+                </form>
+            </div>
+            {% endif %}
+
+            <!-- Results Display -->
+            {% if prediction %}
+            <div class="results">
+                <div class="result-card">
+                    {% if image_data %}
+                    <img src="{{ image_data }}" class="result-image" alt="Uploaded plant image">
+                    {% endif %}
+                    
+                    <div class="result-info">
+                        <h2>{{ prediction.replace('_', ' ').replace('  ', ' - ').title() }}</h2>
+                        <div class="confidence">
+                            {{ confidence }}% Confidence
+                        </div>
+                    </div>
+
+                    {% if description %}
+                    <div class="treatment">
+                        <div class="treatment-content">
+                            {{ description|safe }}
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <button onclick="window.location.href='/'" class="new-analysis-btn">
+                        Analyze Another Image
+                    </button>
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- Features -->
+            <div class="features">
+                <div class="feature">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Instant Analysis</h3>
+                    <p>Get results in seconds</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">🎯</div>
+                    <h3>Accurate Detection</h3>
+                    <p>AI-powered diagnosis</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">💡</div>
+                    <h3>Treatment Advice</h3>
+                    <p>Expert recommendations</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const fileSelected = document.getElementById('fileSelected');
+            const fileName = document.getElementById('fileName');
+            
+            if (e.target.files.length > 0) {
+                fileName.textContent = e.target.files[0].name;
+                fileSelected.classList.add('show');
+            } else {
+                fileSelected.classList.remove('show');
+            }
+        });
+    </script>
+</body>
+</html>
