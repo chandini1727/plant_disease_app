@@ -60,7 +60,7 @@ elif isinstance(descriptions, dict) and not all(c in descriptions for c in class
     app.logger.error("Not all class_names have corresponding descriptions.")
     raise ValueError("Not all class_names have corresponding descriptions.")
 
-# Serve uploaded image files (optional, kept for compatibility)
+# Serve uploaded image files
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
@@ -102,21 +102,20 @@ def index():
                 # Get description
                 if isinstance(descriptions, dict):
                     description = descriptions.get(predicted_class, "No treatment information available.")
-                else:  # Assume list
+                else:
                     description = descriptions[predicted_index] if predicted_index < len(descriptions) else "No treatment information available."
 
-                # Clean up
-                os.remove(filepath)
+                os.remove(filepath)  # Cleanup
 
                 return render_template(
                     'a.html',
                     prediction=predicted_class,
                     confidence=confidence,
-                    image_data=image_data,  # Pass base64 image data
+                    image_data=image_data,
                     description=description
                 )
             except Exception as e:
-                os.remove(filepath)  # Clean up even on error
+                os.remove(filepath)
                 app.logger.error(f"Error processing image: {str(e)}")
                 return render_template('a.html', error=f"Error processing image: {str(e)}")
         else:
@@ -124,7 +123,9 @@ def index():
     
     return render_template('a.html', prediction=None)
 
-application = app  # For WSGI compatibility
+# ✅ For Render & WSGI compatibility
+application = app
 
-if __name__ == '__main__':
-    app.run(debug=False)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))  # Render provides PORT
+    app.run(host="0.0.0.0", port=port, debug=False)
