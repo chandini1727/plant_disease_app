@@ -1,8 +1,3 @@
----
-title: "Plant Disease Detection App"
-description: "AI-powered web system that detects and classifies plant leaf diseases using MobileNetV2 and Flask backend."
----
-
 # Plant Disease Detection App
 
 A Deep Learning-based Web Application that classifies plant leaf diseases in crops like Pepper, Potato, and Tomato using MobileNetV2.  
@@ -68,18 +63,6 @@ Develop a deep learning model capable of classifying plant leaf images into 15 c
 - **Deployment:**
   - Hosted on [Render](https://plant-disease-app-hvgs.onrender.com).
 
----
-
-## Workflow
-
-```mermaid
-graph TD
-A[User Uploads Leaf Image] --> B[Flask Backend]
-B --> C[Preprocess Image (224x224x3)]
-C --> D[MobileNetV2 Model Prediction]
-D --> E[Map Predicted Class to Description]
-E --> F[Return Result: Disease, Confidence, Treatment]
-
 
 ## 💻 Tech Stack
 
@@ -125,32 +108,7 @@ E --> F[Return Result: Disease, Confidence, Treatment]
 
 ---
 
-## 🧱 Flask Backend Code Overview
-
-```python
-# app1.py (Simplified)
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        file = request.files['image']
-        if file and allowed_file(file.filename):
-            filepath = save_image(file)
-            img_array = preprocess(filepath)
-            prediction = model.predict(img_array)
-            result = get_disease_description(prediction)
-            return render_template('a.html', result=result)
-    return render_template('a.html')
-```
-
-✅ Handles upload
-✅ Validates image type
-✅ Runs prediction
-✅ Renders results dynamically
-
----
-
-## 🧪 Testing & Evaluation
+##  Testing & Evaluation
 
 * Model evaluated using test set from PlantVillage.
 * Verified with multiple crop images for accuracy and robustness.
@@ -166,7 +124,7 @@ def index():
 
 ---
 
-## 💡 Future Enhancements
+##  Future Enhancements
 
 * Integration with camera input for real-time detection
 * Multilingual treatment suggestions for farmers
@@ -175,11 +133,6 @@ def index():
 
 ---
 
-## 👩‍💻 Author
-
-**Chandini Chintala**
-🌐 [GitHub](https://github.com/) | 💼 [LinkedIn](https://linkedin.com/)
-🎓 AI | Deep Learning | Full Stack | Cloud Deployments
 
 </motion.div>
 
