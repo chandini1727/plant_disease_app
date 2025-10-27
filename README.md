@@ -132,10 +132,3 @@ Develop a deep learning model capable of classifying plant leaf images into 15 c
 * Convert to mobile app (Flutter + Flask API)
 
 ---
-
-
-</motion.div>
-
-```
-
----
