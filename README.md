@@ -1,40 +1,32 @@
 ---
-title: "🌿 Plant Disease Detection App"
+title: "Plant Disease Detection App"
 description: "AI-powered web system that detects and classifies plant leaf diseases using MobileNetV2 and Flask backend."
 ---
 
-import { motion } from "framer-motion"
+# Plant Disease Detection App
 
-<motion.div 
-  initial={{ opacity: 0, y: 20 }} 
-  animate={{ opacity: 1, y: 0 }} 
-  transition={{ duration: 0.6 }}
->
+A Deep Learning-based Web Application that classifies plant leaf diseases in crops like Pepper, Potato, and Tomato using MobileNetV2.  
+The system provides real-time disease diagnosis, including causes and treatment recommendations — empowering farmers and agronomists with instant, AI-driven insights.
 
-# 🌿 Plant Disease Detection App
-
-A **Deep Learning-based Web Application** that classifies plant leaf diseases in crops like **Pepper, Potato, and Tomato** using **MobileNetV2**.  
-The system provides **real-time disease diagnosis**, including causes and treatment recommendations — empowering **farmers and agronomists** with instant, AI-driven insights.
-
-🎯 **Live Demo:** [Plant Disease App](https://plant-disease-app-hvgs.onrender.com)
+**Live Demo:** [Plant Disease App](https://plant-disease-app-hvgs.onrender.com)
 
 ---
 
-## 🧠 Problem Understanding
+## Problem Understanding
 
-Agriculture is the backbone of our economy, yet **plant diseases** cause billions in losses yearly.  
-Traditional methods are **slow, expensive, and require expert intervention**.
+Agriculture is the backbone of our economy, yet plant diseases cause billions in losses yearly.  
+Traditional methods are slow, expensive, and require expert intervention.
 
-### ❗ Problem Statement
+### Problem Statement
 
-> Develop a deep learning model capable of classifying plant leaf images into **15 categories** (healthy + diseased), providing:
-> - Instant disease identification  
-> - Information on cause (fungal, bacterial, viral)  
-> - Suggested treatments  
+Develop a deep learning model capable of classifying plant leaf images into 15 categories (healthy + diseased), providing:
+- Instant disease identification  
+- Information on cause (fungal, bacterial, viral)  
+- Suggested treatments  
 
 ---
 
-## 🎯 Functional Requirements
+## Functional Requirements
 
 1. **Image Upload Interface**
    - Accepts JPG, PNG, or WebP files.
@@ -49,7 +41,7 @@ Traditional methods are **slow, expensive, and require expert intervention**.
 
 ---
 
-## 🚫 Non-Functional Requirements
+## Non-Functional Requirements
 
 | Category | Description |
 |-----------|--------------|
@@ -62,21 +54,7 @@ Traditional methods are **slow, expensive, and require expert intervention**.
 
 ---
 
-## 🧩 Architecture Design
-
-<motion.div
-  initial={{ scale: 0.9, opacity: 0 }}
-  animate={{ scale: 1, opacity: 1 }}
-  transition={{ duration: 0.6 }}
->
-<img 
-  src="https://raw.githubusercontent.com/ultralytics/assets/main/diagrams/flask-ai-pipeline.png" 
-  alt="Architecture Diagram" 
-  width="700" 
-/>
-</motion.div>
-
-### ⚙️ Components Overview
+## Components Overview
 
 - **Frontend (Flask Templates):** Handles image uploads and displays predictions.
 - **Backend (Flask App):**
@@ -92,7 +70,7 @@ Traditional methods are **slow, expensive, and require expert intervention**.
 
 ---
 
-## 🔄 Workflow
+## Workflow
 
 ```mermaid
 graph TD
@@ -101,9 +79,7 @@ B --> C[Preprocess Image (224x224x3)]
 C --> D[MobileNetV2 Model Prediction]
 D --> E[Map Predicted Class to Description]
 E --> F[Return Result: Disease, Confidence, Treatment]
-````
 
----
 
 ## 💻 Tech Stack
 
