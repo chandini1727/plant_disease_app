@@ -97,13 +97,15 @@ Develop a deep learning model capable of classifying plant leaf images into 15 c
 
 ```json
 {
-  "Tomato___Late_blight": {
+  "Tomato___Early_blight": {
     "crop": "Tomato",
-    "disease": "Late Blight",
-    "cause": "Fungus (Phytophthora infestans)",
-    "treatment": "Use fungicides, remove infected leaves, ensure proper drainage."
+    "disease": "Early Blight",
+    "confidence": "40.36%",
+    "cause": "Caused by Alternaria fungi species. Shows characteristic concentric rings on lower leaves and progresses upward through the plant.",
+    "treatment": "Remove infected leaves immediately. Use fungicide sprays such as chlorothalonil or mancozeb. Practice 3–4 year crop rotation, mulch around plants to prevent soil splash, and ensure proper plant spacing."
   }
 }
+
 ```
 
 ##  Future Enhancements
