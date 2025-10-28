@@ -106,24 +106,6 @@ Develop a deep learning model capable of classifying plant leaf images into 15 c
 }
 ```
 
----
-
-##  Testing & Evaluation
-
-* Model evaluated using test set from PlantVillage.
-* Verified with multiple crop images for accuracy and robustness.
-* Flask tested locally and deployed on Render with 10MB upload limit.
-
----
-
-## 🌍 Live Demo
-
-> 🔗 [https://plant-disease-app-hvgs.onrender.com](https://plant-disease-app-hvgs.onrender.com)
-
-🪴 Upload a leaf image → Get instant diagnosis with confidence and treatment suggestions.
-
----
-
 ##  Future Enhancements
 
 * Integration with camera input for real-time detection
