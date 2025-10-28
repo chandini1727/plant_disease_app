@@ -115,4 +115,3 @@ Develop a deep learning model capable of classifying plant leaf images into 15 c
 * Add more crops and disease datasets
 * Convert to mobile app (Flutter + Flask API)
 
----
