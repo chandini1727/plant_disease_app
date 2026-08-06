@@ -244,9 +244,9 @@ The design contains the risk rather than accepting it:
 | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **S3 credentials exposed to sandbox pods**                                        | Only the trusted **download daemon** stores the S3 credentials. Sandbox pods never receive or access these credentials.                                                                                                 |
 | **A tenant changing the checkpoint path**                                         | The control plane automatically generates the checkpoint path, pod spec, and volumes. Users cannot modify the host path or mount arbitrary directories on the node.                                                     |
-| **One sandbox accessing another sandbox's checkpoint**                            | Each sandbox gets its own checkpoint directory with **0700 permissions**. Only the download daemon can write to it, the wait init-container can only read it, and the directory is deleted after the restore completes. |
+| **One sandbox accessing another sandbox's checkpoint**                            | Each sandbox gets its own checkpoint directory with **0700 permissions**. Only the download daemon can write to it, the wait init-container can only read it, and the directory is deleted after the pod is terminated. |
 | **A malicious checkpoint archive writing files outside the checkpoint directory** | The download daemon validates the archive during extraction and rejects entries containing `..` or absolute paths, preventing files from being written outside the intended directory.                                  |
-| **Checkpoint data remaining on the node after restore**                           | Checkpoint files are protected with restrictive permissions, cleaned up after restore, and protected by node disk encryption while they are stored on the node.                                                         |
+| **Checkpoint data remaining on the node after restore**                           | Checkpoint files are protected with restrictive permissions, cleaned up after the pod is terminated, and protected by node disk encryption while they are stored on the node.                                                         |
 
 The key security principle is that all S3 access and checkpoint preparation happen in the trusted node download daemon, not inside the sandbox pod. The sandbox pod never downloads the checkpoint, never holds S3 credentials, and never writes to the checkpoint directory. It only waits for the checkpoint to become ready, after which runsc restores the sandbox from the local checkpoint directory. This keeps gVisor as the security boundary between the platform and tenant workloads
 
@@ -332,7 +332,7 @@ flowchart LR
 | **Write consistency**       | A restore can only see a fully uploaded snapshot. `.ready` is created only after download and extraction finish.                                                  |
 | **Object size**             | Checkpoints are compressed before uploading to reduce storage, network transfer, and restore time.                                                                |
 | **Node-local disk**         | Temporary checkpoint copies consume local disk during capture and restore, so sufficient node storage is required.                                                |
-| **Garbage Collection (GC)** | The temporary node directory is deleted after restore, while the S3 snapshot remains until it is explicitly deleted or expires according to its retention policy. |
+| **Garbage Collection (GC)** | The temporary node directory is deleted after the pod is terminated, while the S3 snapshot remains until it is explicitly deleted or expires according to its retention policy. |
 
 ### Access and Rollout
 
