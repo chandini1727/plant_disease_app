@@ -1,4 +1,4 @@
-# Design docs : Sandbox Snapshots on Ceph Object Storage (S3)
+# RFC: Sandbox Snapshots on Ceph Object Storage (S3) - Detailed Design
 
 
 ## 1. Summary
@@ -31,38 +31,19 @@ Today, sandbox checkpoints are stored directly in CephFS, which is mounted on ev
 
 
 ```mermaid
-flowchart TD
-    subgraph ControlPlane["Control Plane (aiagent-service)"]
-        CP_CAP["Creates SnapshotJob"]:::cp
-        CP_REST["Creates RestoreJob<br/>Injects wait-init-container"]:::cp
-    end
-
-    subgraph SandboxNode["Sandbox Node (During Capture)"]
-        CA["sandbox-snapshot-agent<br/>Runs 'runsc checkpoint'"]:::cp
-        SCRATCH["Node Local Scratch Folder<br/>(Temporary)"]:::store
-    end
-
-    S3[("Ceph S3 Bucket<br/>(Single Compressed Object)")]:::star
-
-    subgraph RestoreNode["Restore Node (During Restore)"]
-        DD["sandbox-download-daemon<br/>(Reads S3 Link & Downloads)"]:::cp
-        LOCAL["Local Node Checkpoint Folder<br/>(0700 permissions)"]:::store
-        WAIT["wait-init-container<br/>(Mounts hostPath & blocks until .ready marker appears)"]:::dp
-        RUN["runsc Sandbox Pod<br/>(Restores from Local Folder)"]:::dp
-    end
-
-    CP_CAP -->|"1. Triggers Capture"| CA
-    CA -->|"2. Saves Memory State"| SCRATCH
-    SCRATCH -->|"3. Archives, Compresses (tar+zstd) & Uploads"| S3
+flowchart LR
+    CP["aiagent-service"]:::cp -->|"1. Capture"| CA["sandbox-snapshot-agent"]:::dp
+    CA -->|"2. Save"| SCRATCH["Local Scratch"]:::store
+    SCRATCH -->|"3. Upload"| S3[("Ceph S3 Bucket")]:::star
     
-    CP_REST -.->|"4a. Triggers Download Daemon"| DD
-    CP_REST -->|"4b. Pod Starts with wait-init-container"| WAIT
+    CP -.->|"4a. Notify"| DD["sandbox-download-daemon"]:::cp
+    CP -->|"4b. Create Pod"| WAIT["wait-for-checkpoint"]:::dp
     
-    S3 -->|"5. Downloads Archive"| DD
-    DD -->|"6. Creates dir (0700), extracts & creates .ready"| LOCAL
+    S3 -->|"5. Download"| DD
+    DD -->|"6. Extract"| LOCAL["Local Checkpoint Folder"]:::store
     
-    LOCAL -.->|"7. Wait container detects .ready"| WAIT
-    WAIT -->|"8. Init container exits, runsc restore invoked"| RUN
+    LOCAL -.->|"7. Unblock"| WAIT
+    WAIT -->|"8. runsc restore"| RUN["Sandbox Pod"]:::dp
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
