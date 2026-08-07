@@ -1,30 +1,13 @@
-# RFC: Sandbox Snapshots on Ceph Object Storage (S3/RGW)
+# Desigb docs : Sandbox Snapshots on Ceph Object Storage (S3)
 
-| | |
-|---|---|
-| Status | Draft |
-| Scope | sandbox-sr-operator (DP) and aiagent-service (CP): replace the CephFS snapshot store with per-snapshot objects in Ceph's S3 gateway — capture uploads, a node daemon downloads on restore |
-| Related | [`rfc_sandbox_checkpoint_restore.md`](rfc_sandbox_checkpoint_restore.md), [`rfc_sandbox_memory_snapshots.md`](rfc_sandbox_memory_snapshots.md) |
 
-## Summary
+## 1. Summary
 
-Today, sandbox checkpoints are stored directly in CephFS, which is mounted on every data-plane node. This RFC replaces CephFS with Ceph S3 (RGW), where each snapshot is stored as a single compressed object. During capture, the checkpoint is temporarily written to the local node, compressed, and uploaded to S3. During restore, a trusted download daemon fetches the snapshot from S3 into a local directory, and a wait init-container ensures the download is complete before runsc restore starts. This removes the need for a shared filesystem, keeps S3 credentials out of tenant pods, and allows Kubernetes to schedule pods normally without modifying runsc. The only trade-off is that restores are slower because the full checkpoint must be downloaded before restoration begins.
+Today, sandbox checkpoints are stored directly in CephFS, which is mounted on every data-plane node. This RFC changes the design. We will store each snapshot as a single compressed tar archive in Ceph S3 (Object Storage). 
+- When taking a snapshot (**Capture**), the agent archives and compresses the files on the local node and uploads them to S3.
+- When starting from a snapshot (**Restore**), a new background program on the node (the **Download Daemon**) securely downloads the compressed archive from S3, decompresses and extracts it, and lets the sandbox start. A wait init-container ensures the download is complete before runsc restore starts. This removes the need for a shared filesystem, keeps S3 credentials out of tenant pods, and allows Kubernetes to schedule pods normally without modifying runsc. The only trade-off is that restores are slower because the full checkpoint must be downloaded before restoration begins.
 
-## Problem
-
-Today, sandbox snapshots are stored in **CephFS**, which is mounted in **read-write mode on every data-plane node**. When a snapshot is created, the checkpoint is written directly to CephFS. During restore, `runsc` reads the checkpoint directly from the same location. This works because every node has access to the shared CephFS filesystem. 
-
-However, using a shared filesystem creates several challenges:
-
-| **Problem**                                              | **Why it is a problem**                                                                                                                                     |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Single shared filesystem for all snapshot operations** | Every snapshot read and write goes through the same CephFS metadata service, which can become a bottleneck and affects all nodes if it slows down or fails. |
-| **CephFS is mounted on every data-plane node**           | Every node must maintain a read-write mount, increasing operational complexity, security exposure, and making the shared storage harder to scale.           |
-| **No per-snapshot isolation**                            | All snapshots are stored in one shared location, making it difficult to manage quotas, lifecycle policies, and usage for individual snapshots.              |
-
-An object store solves these problems by storing **each snapshot as a separate object** in S3. Any node can download only the snapshot it needs over HTTP, without mounting a shared filesystem. This provides better isolation and simpler storage management. The trade-off is that the entire snapshot must be downloaded before a restore can begin, which increases restore time for larger snapshots.
-
-## Goals
+## 2. Goals
 
 - **Move to Object Storage:** Store each snapshot as a single compressed object in Ceph S3 (RGW) instead of using CephFS.
 - **Remove Shared Mounts:** Data-plane nodes will no longer need to mount a shared filesystem for snapshots.
@@ -33,334 +16,272 @@ An object store solves these problems by storing **each snapshot as a separate o
 - **Don't Change the Runtime:** Ensure `runsc` (the sandbox runtime) can still restore from a local folder just like it does today, without needing any modifications.
 - **Smooth Migration:** Allow the new S3 snapshots to work side-by-side with old CephFS snapshots during the transition, so we don't have to migrate all existing data at once.
 
-## Non-goals
+## 3. Non-Goals
 
-- Not optimising for minimum restore latency. Lazy-paged block restore (RBD) is the
-  documented fast-path alternative if resume/fork latency becomes the constraint.
-- No FUSE-mounting the bucket to fake a filesystem (see Alternatives — object
-  stores serve the checkpoint's random reads poorly).
-- Cross-region replication of snapshots is possible with RGW multi-site but is out
-  of scope for the first version.
+- We are not trying to make the restore speed instant right now. Downloading takes time, and we accept this for now.
+- We will not use FUSE mounts (like `s3fs`) to pretend S3 is a local drive, because it is too slow for the sandbox engine.
+- Backing up snapshots to different regions is out of scope for now.
 
-## Proposal
+## 4. Future Goals
 
-### High-level design
+- **Node-Local Caching:** Implement a node-local NVMe/SSD cache to speed up restores and forks. When a checkpoint is downloaded from S3, we will cache those files locally on the worker node. We will maintain a record of which nodes have cached which checkpoint files. During a restore, we will use a soft `nodeAffinity` to prefer scheduling the pod on the exact node where its checkpoint is already cached, allowing for a very fast restore. If that specific node is busy, Kubernetes will schedule the pod on another available node, which will just perform a normal restore by downloading the checkpoint from S3.
+
+## 5. High-Level Design
+
+
 
 ```mermaid
-flowchart LR
-    subgraph CPsg["Control plane — aiagent-service"]
-        CP["orchestrate checkpoint and pause<br/>inject wait init-container, pass object reference"]:::cp
+flowchart TD
+    subgraph ControlPlane["Control Plane (aiagent-service)"]
+        CP_CAP["Creates SnapshotJob"]:::cp
+        CP_REST["Creates RestoreJob<br/>Injects wait-init-container"]:::cp
     end
 
-    subgraph SNsg["Sandbox node — capture"]
-        AG["capture agent<br/>runsc checkpoint"]:::cp
-        SC["node-local scratch"]:::store
+    subgraph SandboxNode["Sandbox Node (During Capture)"]
+        CA["sandbox-snapshot-agent<br/>Runs 'runsc checkpoint'"]:::cp
+        SCRATCH["Node Local Scratch Folder<br/>(Temporary)"]:::store
     end
 
-    RGW[("Ceph RGW S3<br/>compressed object<br/>durable, shared, no mount")]:::star
+    S3[("Ceph S3 Bucket<br/>(Single Compressed Object)")]:::star
 
-    subgraph RNsg["Restore node — any, scheduler-picked"]
-        DM["download daemon DaemonSet<br/>holds creds, GET plus decompress"]:::cp
-        LD[("per-sandbox node dir<br/>0700 plus ready marker")]:::store
-        POD["restore pod<br/>wait init-container blocks on marker<br/>then runsc restore reads node dir"]:::dp
+    subgraph RestoreNode["Restore Node (During Restore)"]
+        DD["sandbox-download-daemon<br/>(Reads S3 Link & Downloads)"]:::cp
+        LOCAL["Local Node Checkpoint Folder<br/>(0700 permissions)"]:::store
+        WAIT["wait-init-container<br/>(Mounts hostPath & blocks until .ready marker appears)"]:::dp
+        RUN["runsc Sandbox Pod<br/>(Restores from Local Folder)"]:::dp
     end
 
-    CP -->|"1 SnapshotJob"| AG
-    AG -->|"2 checkpoint"| SC
-    SC -->|"3 compress plus upload"| RGW
-    CP -.->|"object reference"| DM
-    RGW -->|"4 download"| DM
-    DM -->|"5 write plus mark ready"| LD
-    LD -->|"6 marker gates start, then restore"| POD
-    CP -->|"GC delete object"| RGW
+    CP_CAP -->|"1. Triggers Capture"| CA
+    CA -->|"2. Saves Memory State"| SCRATCH
+    SCRATCH -->|"3. Archives, Compresses (tar+zstd) & Uploads"| S3
+    
+    CP_REST -.->|"4a. Triggers Download Daemon"| DD
+    CP_REST -->|"4b. Pod Starts with wait-init-container"| WAIT
+    
+    S3 -->|"5. Downloads Archive"| DD
+    DD -->|"6. Creates dir (0700), extracts & creates .ready"| LOCAL
+    
+    LOCAL -.->|"7. Wait container detects .ready"| WAIT
+    WAIT -->|"8. Init container exits, runsc restore invoked"| RUN
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-
-    style CPsg fill:#f3f1ff,stroke:#6b6be0
-    style SNsg fill:#ecfaf6,stroke:#12a594
-    style RNsg fill:#ecfaf6,stroke:#12a594
 ```
 
-The Ceph RGW bucket is the durable centre and the *only* thing shared between
-nodes — reached over HTTP, never mounted. **Capture** (steps 1–3) runs on the
-sandbox's own node: checkpoint to node-local scratch, then compress and upload one
-object. **Restore** (steps 4–6) runs on whatever node the scheduler picked: a
-trusted node **download daemon** pulls the object (using its own scoped S3
-credential) into a per-sandbox node directory and marks it ready; a credential-free **wait
-init-container** in the pod blocks until the marker appears, then `runsc restore`
-reads the directory. The tenant pod holds no credentials and does the download
-nowhere — the daemon does it out-of-band. The runtime is unmodified; its checkpoint
-path is just a node-local directory now instead of a shared CephFS one.
-
-### Why download, not mount
-
-With the current CephFS design, `runsc checkpoint` writes checkpoint files directly to a shared CephFS directory. Since every data-plane node mounts the same filesystem, `runsc restore` can read those files directly without any additional copy or download.
-
-In the proposed design, snapshots are stored as compressed objects in Ceph RGW (S3). Since S3 is an object store rather than a filesystem, `runsc` cannot restore directly from it. The snapshot must first be downloaded, decompressed, and extracted into a local checkpoint directory before `runsc restore` can use it.
-
-There are two ways to make the checkpoint available locally:
-
-- **Download to local disk (chosen).** A trusted node-local download daemon downloads and extracts the snapshot into a per-sandbox checkpoint directory, creates a `.ready` marker, and the wait init-container allows `runsc restore` to start only after the checkpoint is ready. This approach is simple, reliable, and keeps S3 credentials out of sandbox pods.
-- **FUSE-mount the S3 bucket (rejected).** Tools such as s3fs or mountpoint-for-s3 can expose an S3 bucket as a local filesystem. However, every random read performed by `runsc restore` would be translated into HTTP range requests to S3, introducing significant network latency and making restore performance unsuitable for checkpoint workloads.
-
-### Components and responsibilities
+### Components and Responsibilities
 
 | Component | Status | Responsibility |
 |---|---|---|
-| Control plane (aiagent-service) | Existing — extended | Creates snapshot/restore jobs, injects the wait init-container, and passes the snapshot reference to the download daemon . No node selection — the scheduler places the pod. |
-| Capture agent — node DaemonSet | Existing — gains the object-store backend | On the sandbox's own node: takes the snapshot (runsc checkpoint into a transient scratch dir) and uploads it as one compressed object, then clears the scratch. |
-| Download daemon — node DaemonSet | **New** | The only component holding the S3 read credential. When a restore pod lands on its node it downloads and decompresses the object into a per-sandbox node directory, writes a ready marker, and removes the directory on teardown. |
-| Wait init-container | **New** | Injected into each restore pod: credential-free and read-only, it blocks until the daemon's ready marker appears, then exits so the app container starts. |
-| Ceph RGW (S3) bucket | New usage | Stores each snapshot as one compressed, tenant-scoped object — the durable artifact. |
-| runsc / gVisor, kubelet | Unchanged | Checkpoints, and restores from a host path. Not patched or wrapped. |
+| Control Plane (`aiagent-service`) | Existing — Extended | **Currently it** creates snapshot/restore jobs.<br>**Now we extend it to** inject the `wait-init-container` and pass the S3 snapshot reference to the jobs. The scheduler handles pod placement without pinning. |
+| Capture Agent (`sandbox-snapshot-agent`) | Existing — Extended | **Currently it** takes the `runsc checkpoint`.<br>**Now we extend it to** use the S3 object-store backend. It writes to node-local scratch, archives and compresses it (tar+zstd), uploads it to S3, and clears the scratch directory. |
+| Download Daemon (`sandbox-download-daemon`) | **New** | A node DaemonSet and the *only* component holding the S3 read credential. Downloads and extracts the snapshot into a per-sandbox local directory when a restore pod lands on its node, creates a `.ready` marker, and removes the directory on pod teardown. |
+| Wait Init-Container (`wait-for-checkpoint`) | **New** | Injected into each restore pod. It is credential-free and read-only. Blocks until the download daemon's `.ready` marker appears, then exits to let the sandbox start. |
+| Ceph RGW (S3 Bucket) | New Usage | Stores each snapshot as a single compressed, tenant-scoped object (the durable artifact) rather than relying on a shared CephFS mount. |
+| `runsc` (gVisor) & `kubelet` | Unchanged | Checkpoints and restores from a local host path. Requires no patches or wrappers. |
 
-The new pieces are the **download daemon** (a trusted node DaemonSet) and a
-credential-free **wait init-container**. There is no block-device attach, no
-per-restore volume, no node-pinning controller, and no staging record — placement
-stays scheduler-native, and nothing sensitive lives in the tenant pod.
+## 6. Component Implementation Details
 
-### Capture
+### 6.1 `sandbox-download-daemon` (The Download Daemon)
+- **Overview:** A new background application (DaemonSet) that runs on every data-plane node.
+- **Implementation Approach:** This `sandbox-download-daemon` is implemented using Go code. We will keep this code in the `operators/sandbox-download-daemon/` path. This Go code contains the complete, automated logic to authenticate with S3, download the archive, decompress it, extract the files, and create the `.ready` marker. For security, we will **never** hardcode the S3 passwords in the code. Instead, Kubernetes will mount a secure Secret as Environment Variables, and the Go code will read these credentials dynamically at runtime (e.g., using `os.Getenv("S3_ACCESS_KEY")`).
+- **Kubernetes Deployment Blueprint (YAML Specs):** This YAML file is the strict instruction manual for Kubernetes. It is absolutely required to run the Go code and guarantees three critical things:
+  1. **Deployment (`kind: DaemonSet`):** Forces exactly one copy of the Go code to run automatically on every single worker node.
+  2. **Storage Access (`hostPath`):** Grants the Go code permission to save extracted files directly to the physical node's hard drive (`/var/lib/snap-s3`), so the Sandbox can read them later.
+  3. **Security (`secretKeyRef`):** Safely injects the encrypted S3 passwords directly into the Go code's memory as Environment Variables, avoiding hardcoded secrets.
+  
+  The skeletal implementation is as follows:
+  ```yaml
+  apiVersion: apps/v1
+  kind: DaemonSet
+  metadata:
+    name: sandbox-download-daemon
+    namespace: neevai-system
+  spec:
+    selector:
+      matchLabels:
+        app: sandbox-download-daemon
+    template:
+      metadata:
+        labels:
+          app: sandbox-download-daemon
+      spec:
+        containers:
+        - name: daemon
+          image: neevai/sandbox-download-daemon:latest
+          volumeMounts:
+          - name: host-checkpoint-dir
+            mountPath: /var/lib/snap-s3
+          env:
+          - name: S3_CREDENTIALS
+            valueFrom:
+              secretKeyRef:
+                name: s3-read-creds
+                key: credentials
+        volumes:
+        - name: host-checkpoint-dir
+          hostPath:
+            path: /var/lib/snap-s3
+            type: DirectoryOrCreate
+  ```
+- **Behavior:** It watches for new Restore Pods being placed on its node. When it sees one, it uses its secure S3 credentials to download the correct compressed snapshot archive from S3, extracts it into a secure local folder on the node, creates a `.ready` file, and later deletes the folder when the pod is deleted.
 
-The capture agent runs on the sandbox's own node (it must, to reach the runtime):
+### 6.2 `wait-init-container` (The Wait Init-Container)
+- **Overview:** A very small, simple container added to the start sequence of the sandbox.
+- **Implementation Approach:** During a Restore or Resume flow, the Control Plane (`aiagent-service`) will automatically inject this `initContainer` into the Sandbox Pod YAML. It will have NO S3 credentials and NO network access.
+- **Kubernetes Deployment Blueprint (YAML Specs):** This is the exact shape of the full Restore Pod after the Control Plane injects the `initContainer` and the `hostPath` annotations.
+  ```yaml
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      <checkpoint-host-path>: /var/lib/snap-s3/<ns>/<job>    # runtime restores the agent from here (host path)
+  spec:
+    runtimeClassName: gvisor
+    volumes:
+      - name: ready                                          # read-only view for the waiter only
+        hostPath: { path: /var/lib/snap-s3/<ns>/<job> }
+    initContainers:
+      - name: wait-for-checkpoint                            # injected by the control plane; no credentials
+        # block until the daemon's ready marker exists
+        volumeMounts: [{ name: ready, mountPath: /ck, readOnly: true }]
+    containers:
+      - name: agent                                          # restored by runsc from the host-path annotation
+      - name: sandboxd                                       # sidecar, part of the restored sandbox
+  # the download daemon (node DaemonSet, not shown) holds the S3 credential and
+  # populates /var/lib/snap-s3/<ns>/<job> out-of-band
+  ```
+- **Behavior:** It mounts the local folder as read-only. It runs a simple bash loop (`while [ ! -f /ck/.ready ]; do sleep 1; done`) to block the pod from starting. It waits patiently until the `sandbox-download-daemon` finishes downloading and extracting the files. Once the `.ready` file appears, this container immediately exits successfully, allowing the main sandbox to boot up safely.
 
-| Step | Action |
-|---|---|
-| Checkpoint | `runsc checkpoint --leave-running` into a transient scratch directory on the node (node-local disk, or a node-scoped scratch volume for crash-durability) |
-| Upload | compress the checkpoint (tar + zstd) and multipart-upload it as one object, keyed by tenant and job; record the object reference |
-| Cleanup | delete the local scratch once the upload completes |
-| Failure | on any error, delete the scratch and the partial object, then retry |
+### 6.3 `sandbox-snapshot-agent` (The Capture Agent - Update)
+- **Overview:** The existing daemon on the node that talks to `runsc` to save the sandbox memory.
+- **Implementation Approach:** We will update its Go code to add S3 upload capabilities. We will give it S3 write credentials.
+- **Behavior:** Instead of writing to CephFS, it will tell `runsc` to write to a temporary local folder. Then, it will use `tar` and `zstd` to archive and compress the folder, upload the compressed object to S3, and finally delete the temporary folder.
 
-The checkpoint uses leave-running, so the compress-and-upload work is never sandbox
-downtime — it only affects how soon the snapshot reaches Ready.
+### 6.4 `aiagent-service` (The Control Plane - Update)
+- **Overview:** The central brain managing sandboxes.
+- **Implementation Approach:** Update the Go code that builds the Pod definitions.
+- **Behavior:** When creating a restore pod, it will inject the `wait-for-checkpoint` init-container and set the correct local `hostPath` so `runsc` knows where to look for the downloaded files.
 
-### Restore (and fork, rollback, resume)
 
-Restore is a download done by a trusted node daemon, and it needs no special
-placement:
+## 7. Operational Workflows
 
-| Step | Action |
-|---|---|
-| Schedule | the pod is created and scheduled **normally** — any node, full scheduler fit/taints/spread, no pinning |
-| Download | the node's download daemon `GET`s the object with its own scoped S3 credential, decompresses it into a per-sandbox node directory, and writes a ready marker |
-| Gate | a credential-free wait init-container in the pod blocks until the ready marker appears, then exits |
-| Restore | the app container starts and `runsc restore` reads the checkpoint from the node directory (host path) |
-| Teardown | the daemon removes the node directory when the pod is gone |
-
-Ordering is solved by construction: the wait init-container completes only once the
-daemon has marked the directory ready, and an init-container always completes before
-the app container starts, so the checkpoint is present before `runsc restore` runs —
-no stage record, scheduling gate, or node-pinning. A probe cannot do this job:
-gVisor restores at container *create*, which is before any startup/readiness probe
-runs. Fork, rollback, and resume are the same flow; resume targets the same sandbox,
-fork a new one. Each fork downloads its own copy unless a per-node cache is added
-(see open questions).
-
-### Restore pod anatomy
-
-The download is done by the trusted node **download daemon**, not inside the pod, so
-the pod carries no credentials. The restore pod adds only two things over a normal
-sandbox pod: a credential-free **wait init-container** and the checkpoint host-path
-annotation.
-
+### 7.1 Snapshot Capture Workflow
 ```mermaid
 flowchart LR
-    CP["Control plane<br/>injects wait init-container,<br/>passes object reference"]:::cp
-    RGW[("Ceph RGW S3<br/>snapshot object")]:::star
-    DM["download daemon DaemonSet<br/>holds creds, GET plus decompress"]:::cp
-    ND[("per-sandbox node dir<br/>0700 plus ready marker")]:::store
+    CP["aiagent-service"]:::cp -->|"1. Start Capture"| SA["sandbox-snapshot-agent"]:::dp
+    SA -->|"2. runsc checkpoint"| SC["Local Scratch"]:::store
+    SC -->|"3. Tar+Upload"| S3[("Ceph S3 Bucket")]:::star
+    S3 -.->|"4. 200 OK"| SA
+    SA -->|"5. Delete Scratch"| SC
 
-    subgraph POD["Restore pod — runtimeClass gVisor, any node"]
-        direction TB
-        WAIT["wait init-container<br/>credential-free, blocks on marker"]:::dp
-        AGENT["agent container<br/>restored by runsc from node dir"]:::dp
-        SD["sandboxd sidecar<br/>part of the restored sandbox"]:::dp
-    end
-
-    CP -.->|"object reference"| DM
-    RGW -->|"1 download object"| DM
-    DM -->|"2 write checkpoint plus ready marker"| ND
-    ND -->|"3 marker seen"| WAIT
-    WAIT ==>|"init exits, then app starts"| AGENT
-    ND -->|"4 runsc restore reads (host path)"| AGENT
-    AGENT --- SD
-
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
-    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-    style POD fill:#ecfaf6,stroke:#12a594
-```
-
-- The **download daemon** is a trusted node DaemonSet — the only component with the
-  S3 credential. Triggered when a restore pod lands on its node, it downloads and
-  decompresses the object into a per-sandbox node directory (mode `0700`) and writes
-  a ready marker. The tenant pod never holds a credential and never runs the
-  download.
-- The **wait init-container** is injected by the control plane, credential-free, and
-  read-only. It blocks until the ready marker appears, then exits so the app
-  container starts. It observes the marker through a read-only view of the node
-  directory — its entire footprint.
-- The **agent container** and the **sandboxd sidecar** are part of the captured
-  sandbox and restored together; `runsc` reads the checkpoint from the node
-  directory (host path) out-of-band — the agent container mounts nothing.
-- **Ordering is free**: the wait init-container finishes (marker present) before the
-  app container starts. A probe cannot substitute — gVisor restores at container
-  create, before probes run.
-
-Illustrative shape (fields that differ from a fresh sandbox pod):
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  annotations:
-    <checkpoint-host-path>: /var/lib/snap-s3/<ns>/<job>    # runtime restores the agent from here (host path)
-spec:
-  runtimeClassName: gvisor
-  volumes:
-    - name: ready                                          # read-only view for the waiter only
-      hostPath: { path: /var/lib/snap-s3/<ns>/<job> }
-  initContainers:
-    - name: wait-for-checkpoint                            # injected by the control plane; no credentials
-      # block until the daemon's ready marker exists
-      volumeMounts: [{ name: ready, mountPath: /ck, readOnly: true }]
-  containers:
-    - name: agent                                          # restored by runsc from the host-path annotation
-    - name: sandboxd                                       # sidecar, part of the restored sandbox
-# the download daemon (node DaemonSet, not shown) holds the S3 credential and
-# populates /var/lib/snap-s3/<ns>/<job> out-of-band
-```
-
-### Security of the checkpoint directory
-
-The checkpoint must temporarily exist on the node's local filesystem because runsc restore can only restore from a local host path. It cannot restore directly from S3. During restore, the download daemon—a trusted node DaemonSet—downloads the snapshot from S3, extracts it into a per-sandbox checkpoint directory, and creates the .ready marker. The restore pod never accesses S3 directly and never receives S3 credentials. Its only addition is a credential-free, read-only wait init-container, which waits for the .ready marker before allowing the application container to start.
-
-The design contains the risk rather than accepting it:
-
-| **Risk**                                                                          | **Mitigation**                                                                                                                                                                                                          |
-| --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **S3 credentials exposed to sandbox pods**                                        | Only the trusted **download daemon** stores the S3 credentials. Sandbox pods never receive or access these credentials.                                                                                                 |
-| **A tenant changing the checkpoint path**                                         | The control plane automatically generates the checkpoint path, pod spec, and volumes. Users cannot modify the host path or mount arbitrary directories on the node.                                                     |
-| **One sandbox accessing another sandbox's checkpoint**                            | Each sandbox gets its own checkpoint directory with **0700 permissions**. Only the download daemon can write to it, the wait init-container can only read it, and the directory is deleted after the pod is terminated. |
-| **A malicious checkpoint archive writing files outside the checkpoint directory** | The download daemon validates the archive during extraction and rejects entries containing `..` or absolute paths, preventing files from being written outside the intended directory.                                  |
-| **Checkpoint data remaining on the node after restore**                           | Checkpoint files are protected with restrictive permissions, cleaned up after the pod is terminated, and protected by node disk encryption while they are stored on the node.                                                         |
-
-The key security principle is that all S3 access and checkpoint preparation happen in the trusted node download daemon, not inside the sandbox pod. The sandbox pod never downloads the checkpoint, never holds S3 credentials, and never writes to the checkpoint directory. It only waits for the checkpoint to become ready, after which runsc restores the sandbox from the local checkpoint directory. This keeps gVisor as the security boundary between the platform and tenant workloads
-
-### Operation flows
-
-Two primitives touch the store: **checkpoint** (capture uploads an object) and
-**restore** (the daemon downloads it). Pause is an implicit checkpoint then
-scale-to-zero; resume is a restore of the pause object.
-
-Checkpoint:
-
-```mermaid
-flowchart LR
-    R["Sandbox Running"]:::dp
-    AG["Capture agent on node<br/>runsc checkpoint to scratch"]:::cp
-    UP["Compress and multipart upload"]:::cp
-    S3[("Ceph RGW S3<br/>object = durable")]:::star
-    R --> AG --> UP --> S3
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-```
-
-Pause — implicit checkpoint, then free the compute:
-
-```mermaid
-flowchart LR
-    R["Sandbox Running"]:::dp
-    AG["Capture agent on node<br/>implicit checkpoint plus upload"]:::cp
-    S3[("Ceph RGW S3<br/>object")]:::star
-    Z["Paused<br/>pod scaled to zero"]:::store
-    R --> AG --> S3
-    S3 -->|"upload done, control plane scales to zero"| Z
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
 ```
 
-Resume — the daemon downloads the pause object and the pod restores in place:
-
+### 7.2 Pausing Workflow
 ```mermaid
 flowchart LR
-    Z["Paused"]:::store
-    DM["node download daemon<br/>GET plus decompress"]:::cp
-    S3[("Ceph RGW S3<br/>pause object")]:::star
-    WAIT["pod wait init-container<br/>blocks on ready marker"]:::dp
-    R["Running<br/>gVisor restore from node dir"]:::dp
-    Z --> DM
-    S3 -->|"download"| DM
-    DM -->|"write plus mark ready"| WAIT
-    WAIT ==>|"init exits, app starts"| R
+    CP["aiagent-service"]:::cp -->|"1. Start Capture"| SA["sandbox-snapshot-agent"]:::dp
+    SA -->|"2. runsc checkpoint"| SC["Local Scratch"]:::store
+    SC -->|"3. Tar+Upload"| S3[("Ceph S3 Bucket")]:::star
+    S3 -.->|"4. 200 OK"| SA
+    SA -->|"5. Delete Scratch"| SC
+    CP -->|"6. Pause Sandbox (Delete Pod)"| POD["Sandbox Pod"]:::dp
+
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
 ```
 
-Restore, fork, or rollback — the daemon downloads a chosen object into a target
-sandbox:
-
+### 7.3 Resume Workflow
 ```mermaid
 flowchart LR
-    A["Snapshot selected<br/>explicit or pause"]:::store
-    DM["node download daemon<br/>GET plus decompress"]:::cp
-    S3[("Ceph RGW S3<br/>object")]:::star
-    WAIT["pod wait init-container<br/>blocks on ready marker"]:::dp
-    N["Restored sandbox<br/>new fork or in-place rollback"]:::dp
-    A --> DM
-    S3 -->|"download"| DM
-    DM -->|"write plus mark ready"| WAIT
-    WAIT ==>|"init exits, app starts"| N
+    CP["aiagent-service"]:::cp -->|"1. Create Pod"| WAIT["wait-for-checkpoint"]:::dp
+    CP -.->|"2. Notify"| DD["sandbox-download-daemon"]:::cp
+    S3[("S3 (Paused Snapshot)")]:::star -->|"3. Download"| DD
+    DD -->|"4. Extract & .ready"| LD["Per-node Sandbox Directory"]:::store
+    LD -.->|"5. Unblock"| WAIT
+    WAIT -->|"6. runsc restore"| RUN["Sandbox Pod"]:::dp
+
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
 ```
 
-### Consistency, sizing, GC
+### 7.4 Restore / Fork from Snapshot Workflow
+```mermaid
+flowchart LR
+    CP["aiagent-service"]:::cp -->|"1. Inject Waiter"| WAIT["wait-for-checkpoint"]:::dp
+    S3[("S3 (Chosen Snapshot)")]:::star -->|"2. Download"| DD["sandbox-download-daemon"]:::cp
+    DD -->|"3. Extract & .ready"| LD["Per-node Sandbox Directory"]:::store
+    LD -.->|"4. Unblock"| WAIT
+    WAIT -->|"5. runsc restore"| RUN["Sandbox Pod"]:::dp
 
-| Concern                     | Approach                                                                                                                                                 |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Write consistency**       | A restore can only see a fully uploaded snapshot. `.ready` is created only after download and extraction finish.                                                  |
-| **Object size**             | Checkpoints are compressed before uploading to reduce storage, network transfer, and restore time.                                                                |
-| **Node-local disk**         | Temporary checkpoint copies consume local disk during capture and restore, so sufficient node storage is required.                                                |
-| **Garbage Collection (GC)** | The temporary node directory is deleted after the pod is terminated, while the S3 snapshot remains until it is explicitly deleted or expires according to its retention policy. |
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
+```
 
-### Access and Rollout
+### 7.5 Live Forking Workflow
+```mermaid
+flowchart LR
+    CP["aiagent-service"]:::cp -->|"1. Start Capture"| SA["sandbox-snapshot-agent"]:::dp
+    SA -->|"2. runsc checkpoint"| SC["Local Scratch"]:::store
+    SC -->|"3. Tar+Upload"| S3[("S3 (Recently Taken Snapshot)")]:::star
+    S3 -.->|"4. 200 OK"| CP
+    CP -->|"5. Create NEW Pod"| WAIT["wait-for-checkpoint"]:::dp
+    S3 -->|"6. Download"| DD["sandbox-download-daemon"]:::cp
+    DD -->|"7. Extract to NEW folder"| LD["Per-node Sandbox Directory"]:::store
+    LD -.->|"8. Unblock"| WAIT
+    WAIT -->|"9. runsc restore"| RUN["New Sandbox Pod"]:::dp
 
-- **Snapshot Storage:** Each sandbox snapshot is stored as a separate object (or object prefix) in Ceph RGW and accessed over HTTP, eliminating the need for a shared filesystem or block-device attachment.
-- **Credential Management:** The download daemon is the only component that holds the S3 read credential and uses it to download snapshots during restore. The capture agent is the only component that holds the S3 write credential and uploads snapshots during capture. The control plane only passes the snapshot object reference, while sandbox pods never receive S3 credentials.
-- **Platform Isolation:** Both the capture agent and download daemon are trusted platform components running on the node. Tenant workloads cannot access these components or their credentials.
-- **Gradual Rollout:** The platform supports both CephFS and S3 snapshot backends during the migration. Existing CephFS snapshots continue to restore normally, while new snapshots are stored in S3. This allows a gradual rollout without requiring migration of existing snapshots.
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef store fill:#eceef3,stroke:#8a93a6,color:#20233a
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
+```
 
-## Alternatives considered
+### 7.6 How Local Storage is Cleaned Up After Deletion
+- Checkpoint files take up space on the node's local hard drive.
+- When a sandbox is stopped or fully deleted by the user, Kubernetes removes the pod from the node.
+- The `sandbox-download-daemon` is constantly watching the node. When it detects that a pod has been deleted, it automatically deletes the local folder (e.g., `rm -rf /var/lib/snap-s3/<namespace>/<job>`).
+- This guarantees that no snapshot data is left behind on the node taking up space.
 
-| Alternative | Why not (for this RFC) |
-|---|---|
-| **Keep CephFS** | The status quo. Simple ops and free cross-node visibility, but the metadata-server bottleneck, shared read-write mount blast radius, and absent per-snapshot isolation are what we want to escape. |
-| **In-pod downloader init-container** | Have the init-container itself download the object rather than a node daemon. Simpler — one fewer component — but it puts an S3 credential (or a pre-signed URL to work around that) and a read-write host mount inside every restore pod, which the tenant shares. The node-daemon split keeps the credential and the download out of tenant pods entirely — the daemon is a platform component the sandbox cannot reach — leaving only a credential-free read-only waiter, so it is preferred. |
-| **RBD block, read-only snapshot map** | Each snapshot is an RBD image with a protected read-only snapshot; restore maps it read-only and gVisor lazily pages memory over the network, so a big-memory sandbox can be running before most of its memory transfers, and forks share blocks. Strictly faster restore than download. Rejected here because it is single-attach: restore must map the volume on a specific node before the container starts, forcing control-plane node selection plus a durable stage record and a scheduling-gate handshake. **This is the fast-restore fallback if download latency becomes the constraint.** |
-| **Download-then-pin (no waiter)** | A node daemon downloads and the control plane creates the pod pinned to that node only once ready — zero in-pod footprint, but it reintroduces control-plane node selection and a readiness handshake (the RBD stage-then-pin shape). Rejected for the same complexity; the wait init-container keeps placement scheduler-native for the price of a tiny credential-free container. |
-| **FUSE-mount the bucket** | Makes the object look like a mounted path, but restore's random reads of the memory-pages file map to small random range-GETs at tens-of-milliseconds each, so paging is pathologically slow. Unsuitable for checkpoint I/O. |
+### 7.7 How We Will Do a Smooth Migration
+- We will support **both** the old CephFS way and the new S3 way at the same time.
+- In the database, every snapshot record will have a link (e.g., `cephfs://path/to/snapshot` or `s3://bucket/snapshot.tar.zst`).
+- When restoring, the `aiagent-service` will check the link format.
+  - If it starts with `cephfs://`, it will build the Pod the old way (mounting the shared folder).
+  - If it starts with `s3://`, it will build the Pod the new way (injecting the `wait-for-checkpoint` container and relying on the download daemon).
+- All *new* snapshots will be created as `s3://`. 
+- We do not need to convert old snapshots. They will stay on CephFS and continue to work until they naturally expire or are deleted by the user.
 
-## Risks, trade-offs, open questions
+---
 
-**Risks / trade-offs**
+## 8. Security Considerations
+- **No S3 Credentials in User Pods:** The `wait-for-checkpoint` init-container and the `runsc` sandbox NEVER have access to S3 credentials. All S3 downloads are strictly handled by the trusted `sandbox-download-daemon`.
+- **Directory Permissions:** The local scratch directory created by the daemon (e.g. `/var/lib/snap-s3/<ns>/<job>`) is created with strict **`0700`** permissions. Only the daemon and the root node components can access the raw checkpoint files.
+- **Secure Archive Extraction:** The daemon will enforce strict checks during tar extraction to ensure no files are extracted outside of the designated sandbox directory (preventing Zip Slip/tar traversal attacks).
 
-- **Restore speed depends on memory size.** Because we have to download the entire snapshot before starting the sandbox, large memory footprints will take longer to restore. Our main strategy to fix this is *cache-affinity scheduling*: telling Kubernetes to prefer nodes that already have a cached copy of the snapshot. This turns a slow download into a near-instant restore, while gracefully falling back to downloading if those nodes are busy.
-- **Duplicate Downloads (Fork Amplification).** If a user creates multiple clones (forks) of a snapshot and they are scheduled on different nodes, every single node has to download its own copy from S3. *(Implementing the node-local cache fixes this).*
-- **Local Disk Space Pressure.** Taking new snapshots and caching downloaded ones both use up the node's local hard drive space. If too many large snapshots happen on the same node at once, the node could run out of disk space.
-- **Extra Data Movement & CPU Usage.** We have to fully compress and upload the data when saving, and fully download and decompress it when restoring. This uses more network bandwidth and CPU power compared to just reading exactly what we need directly from a shared folder.
+## 9. Risks and Mitigations
+- **Node Disk Space Exhaustion:** 
+  - *Risk:* If multiple large sandboxes are saved/restored on the same node, the local disk could fill up.
+  - *Mitigation:* The `sandbox-snapshot-agent` deletes scratch files immediately upon successful S3 upload. The `sandbox-download-daemon` actively watches Kubernetes pod deletion events and runs immediate cleanup (`rm -rf`) on the local folder when a sandbox terminates.
+- **Download Daemon Failure:**
+  - *Risk:* The `sandbox-download-daemon` crashes while downloading a snapshot.
+  - *Mitigation:* It is deployed as a Kubernetes `DaemonSet`. Kubelet will automatically restart it. The daemon will wipe partial downloads and resume/restart the S3 download cleanly upon reboot.
+- **Large Snapshot Latency:**
+  - *Risk:* 10GB+ memory footprints may take a long time to download over the network, delaying sandbox boot.
+  - *Mitigation:* We use `zstd` compression to heavily compress the archive before upload. 
 
-**Open questions (need a human decision)**
+**10. Open questions (need a human decision)**
 
 1. **Caching & Scheduling:** Should we cache downloaded snapshots on the node's local disk and use soft `nodeAffinity` to prefer those nodes during future restores? *(This prevents redundant S3 downloads, but requires managing node disk space).*
 2. **Streaming Restore:** Should we let the sandbox start immediately and load memory pages over the network as it runs, instead of waiting for the full download to finish? *(This is faster, but very risky if the network drops).*
@@ -368,52 +289,3 @@ flowchart LR
 4. **Compression Choice:** How hard should we compress the snapshot before uploading? *(We need to balance the CPU cost of compression against the savings in object size, especially since memory data often doesn't compress well).*
 5. **Object Durability Tier:** Do we need to back up these snapshots to different geographical regions, or is a single-region S3 bucket enough?
 6. **Waiter Readiness Signal:** How should the Restore Pod know when the download is finished? Should it look for a hidden `.ready` file on the hard drive *(requires a `hostPath` mount)*, or should it ask the Kubernetes API *(requires giving the pod API credentials)*?
-
-## Appendix
-
-### A. Storage-backend contract
-
-A snapshot-storage backend owns four things: where a checkpoint is written,
-finalising it into a durable reference, deleting it idempotently, and the reference
-scheme it owns. The CephFS backend writes straight to the final path and finalises
-by doing nothing. The object-store backend writes to node-local scratch, and
-finalises by compressing and uploading the object (then clearing scratch); its
-reference is the object key. Restore is handled by the node download daemon and the
-wait init-container, not the backend.
-
-### B. Storage reference and restore contract
-
-- Reference form: `s3://<bucket>/<org>/<project>/<sandbox>/snapshot-<job>.tar.zst`,
-  recorded alongside the snapshot record exactly as the CephFS reference is today.
-- The restore plan injects a credential-free wait init-container and sets the
-  checkpoint host-path annotation to the per-sandbox node directory the download
-  daemon populates. The pod is scheduled normally — no node affinity or pinning.
-
-### C. Command flow
-
-```
-CAPTURE (sandbox node — capture agent)
-  runsc checkpoint --leave-running --image-path=<scratch>
-  tar -C <scratch> . | zstd | s3 multipart put  s3://<bucket>/<key>
-  rm -rf <scratch>
-
-RESTORE
-  # node download daemon (holds the scoped credential), when a restore pod lands:
-  s3 get s3://<bucket>/<key> | zstd -d | tar -x -C /var/lib/snap-s3/<ns>/<job>
-  touch /var/lib/snap-s3/<ns>/<job>/.ready
-  # pod wait init-container (credential-free, read-only): blocks until .ready exists
-  # app container (runsc shim):
-  runsc restore --image-path=/var/lib/snap-s3/<ns>/<job>
-  # teardown: daemon removes the node directory when the pod is gone
-
-DELETE
-  s3 rm s3://<bucket>/<key>            # or bucket lifecycle / TTL
-```
-
-### D. Prior art
-
-This is close to the object-store design the codebase used before the
-CephFS-in-place refactor (an S3-compatible client to Ceph RGW, compressed blobs, and
-a per-node scratch dir). The delta from that design is two-fold: coexistence with
-the current CephFS backend via scheme dispatch, and moving the download out of an
-in-pod init-container into a trusted node daemon so tenant pods hold no credentials.
