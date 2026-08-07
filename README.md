@@ -1,4 +1,4 @@
-# Desigb docs : Sandbox Snapshots on Ceph Object Storage (S3)
+# Design docs : Sandbox Snapshots on Ceph Object Storage (S3)
 
 
 ## 1. Summary
